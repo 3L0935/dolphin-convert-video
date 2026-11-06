@@ -1,0 +1,30 @@
+[Desktop Entry]
+Type=Service
+MimeType=video/*;
+Actions=share;share-gpu;small;best;size
+X-KDE-Submenu=Convert video
+
+[Desktop Action share]
+Name=For sharing (plays everywhere)
+Icon=document-share
+Exec=@BIN@ share %F
+
+[Desktop Action share-gpu]
+Name=For sharing, faster (uses GPU)
+Icon=speedometer
+Exec=@BIN@ share-gpu %F
+
+[Desktop Action small]
+Name=Smaller file (720p)
+Icon=zoom-out
+Exec=@BIN@ small %F
+
+[Desktop Action best]
+Name=Best quality (big file)
+Icon=games-highscores
+Exec=@BIN@ best %F
+
+[Desktop Action size]
+Name=Fit to size...
+Icon=transform-scale
+Exec=@BIN@ size %F

@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# convert-video: convert any video to an H.264 MP4 that plays (and previews) everywhere.
+# https://github.com/3L0935/dolphin-convert-video
+#
+# Usage: convert-video PRESET FILE...
+#   share      : max compatibility (Jira/Discord/Slack/browser preview).
+#                <=1080p, 30 fps, H.264 Main 4.1, AAC, faststart,
+#                dimensions cropped to a multiple of 8 (1082 -> 1080).
+#   share-gpu  : same profile, encoded on the GPU (VAAPI). Faster, a bit bigger.
+#   small      : share profile at 720p, CRF 26. Small files.
+#   best       : original resolution and fps, CRF 18, High profile. Big files,
+#                in-browser previews (e.g. Jira) may not work.
+#   size       : asks a target size in MB, 2-pass encode to hit it.
+# Output goes next to the source and never overwrites anything:
+#   <name>.share.mp4 / .share-fast.mp4 / .small.mp4 / .best.mp4 / .<N>MB.mp4
+#
+# Env: CONVERT_VIDEO_VAAPI_DEVICE (default /dev/dri/renderD128)
+
+set -u
+PRESET="${1:-}"; shift || true
+[ $# -eq 0 ] && { echo "usage: $0 share|share-gpu|small|best|size FILE..." >&2; exit 1; }
+
+ICON=video-x-generic
+VAAPI_DEV="${CONVERT_VIDEO_VAAPI_DEVICE:-/dev/dri/renderD128}"
+total=$#; n=0; ok=0; failed=()
+notify() { notify-send -a "Convert video" -i "$ICON" "$@" 2>/dev/null || echo "$*" >&2; }
+
+# qdbus has a different name depending on the distro
+QDBUS=""
+for q in qdbus6 qdbus-qt6 /usr/lib/qt6/bin/qdbus qdbus; do
+    command -v "$q" >/dev/null 2>&1 && { QDBUS=$q; break; }
+done
+for dep in ffmpeg ffprobe kdialog; do
+    command -v "$dep" >/dev/null 2>&1 || { notify -u critical "Convert video" "Missing dependency: $dep"; exit 1; }
+done
+qd() { [ -n "$QDBUS" ] && "$QDBUS" "$@" 2>/dev/null; }
+
+# Crop to a multiple of 8 (removes odd sizes like 1082 px), cap the SHORT side
+# (so portrait phone videos stay sane), cap fps to 30, force 8-bit 4:2:0.
+compat_vf() { # $1 = max short side
+    echo "crop=trunc(iw/8)*8:trunc(ih/8)*8,scale='if(gte(iw,ih),-2,min($1,iw))':'if(gte(iw,ih),min($1,ih),-2)',fps=30,format=yuv420p"
+}
+
+TARGET_MB=""
+if [ "$PRESET" = size ]; then
+    TARGET_MB=$(kdialog --title "Fit to size" --icon "$ICON" \
+        --inputbox "Target size per file (MB)" "10") || exit 0
+    [[ "$TARGET_MB" =~ ^[0-9]+([.][0-9]+)?$ ]] || { notify -u critical "Invalid size" "$TARGET_MB"; exit 1; }
+fi
+
+# run_ffmpeg OFFSET SPAN ffmpeg-args... : progress mapped to OFFSET..OFFSET+SPAN %
+run_ffmpeg() {
+    local off=$1 span=$2; shift 2
+    ffmpeg -hide_banner -nostdin -loglevel error -y "$@" -progress pipe:1 -nostats \
+        2>>"$LOG" | while IFS='=' read -r k v; do
+            if [ "$k" = out_time_us ] && [ "$dur_us" -gt 0 ] && [[ "$v" =~ ^[0-9]+$ ]]; then
+                qd "$dsvc" "$dpath" Set "" value $(( off + v * span / dur_us )) >/dev/null
+            fi
+            if [ "$(qd "$dsvc" "$dpath" wasCancelled)" = true ]; then
+                pkill -INT -P $$ -x ffmpeg; break
+            fi
+        done
+    return "${PIPESTATUS[0]}"
+}
+
+for src in "$@"; do
+    n=$((n+1))
+    [ -f "$src" ] || { failed+=("$(basename "$src") (not found)"); continue; }
+    base="$(basename "${src%.*}")"
+    dir="$(dirname "$src")"
+    # one suffix per preset, so outputs never collide
+    case "$PRESET" in
+        share-gpu) suffix=share-fast ;;
+        size)      suffix="${TARGET_MB}MB" ;;
+        *)         suffix=$PRESET ;;
+    esac
+    dst="$dir/$base.$suffix.mp4"
+    [ -e "$dst" ] && { failed+=("$base (already exists)"); continue; }
+
+    # any container/codec ffmpeg can read is fine; only reject files without video
+    has_video=$(ffprobe -v error -select_streams V:0 -show_entries stream=codec_type -of default=nw=1:nk=1 "$src" 2>/dev/null)
+    [ -n "$has_video" ] || { failed+=("$base (no video stream / unreadable)"); continue; }
+    dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$src")
+    dur_us=$(awk -v d="${dur:-0}" 'BEGIN{printf "%d", d*1000000}')
+    has_audio=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nw=1:nk=1 "$src")
+    abr=192k
+    vin=(); passes=1
+
+    case "$PRESET" in
+        share)
+            vopts=(-vf "$(compat_vf 1080)" -c:v libx264 -preset fast -crf 22
+                   -profile:v main -level 4.1) ;;
+        share-gpu)
+            vin=(-vaapi_device "$VAAPI_DEV")
+            vopts=(-vf "$(compat_vf 1080),format=nv12,hwupload" -c:v h264_vaapi
+                   -profile:v main -level 41 -rc_mode CQP -qp 22) ;;
+        small)
+            abr=128k
+            vopts=(-vf "$(compat_vf 720)" -c:v libx264 -preset fast -crf 26
+                   -profile:v main -level 4.1) ;;
+        best)
+            vopts=(-c:v libx264 -preset slow -crf 18 -pix_fmt yuv420p -profile:v high) ;;
+        size)
+            abr=128k; passes=2
+            # bitrate budget: 97% of target, minus audio
+            akbps=0; [ -n "$has_audio" ] && akbps=128
+            vkbps=$(awk -v mb="$TARGET_MB" -v d="$dur" -v a="$akbps" \
+                'BEGIN{v=(mb*8388.608*0.97)/d - a; printf "%d", (v<100?100:v)}')
+            h=1080; [ "$vkbps" -lt 2500 ] && h=720; [ "$vkbps" -lt 800 ] && h=480
+            vopts=(-vf "$(compat_vf $h)" -c:v libx264 -preset fast -b:v "${vkbps}k"
+                   -maxrate "$((vkbps*3/2))k" -bufsize "$((vkbps*2))k"
+                   -profile:v main -level 4.1) ;;
+        *) echo "unknown preset: $PRESET" >&2; exit 1 ;;
+    esac
+    if [ -n "$has_audio" ]; then aopts=(-c:a aac -b:a "$abr" -ac 2); else aopts=(); fi
+
+    dlg=$(kdialog --title "Convert video ($n/$total)" --icon "$ICON" --progressbar "$base" 100)
+    dsvc=${dlg% *}; dpath=${dlg#* }
+    qd "$dsvc" "$dpath" showCancelButton true >/dev/null
+
+    tmp="$dst.part.mp4"; LOG="$dst.log"; : >"$LOG"
+    if [ "$passes" = 2 ]; then
+        plog="$dir/.$base.2pass"
+        run_ffmpeg 0 50 "${vin[@]}" -i "$src" -map 0:V:0 "${vopts[@]}" -pass 1 \
+            -passlogfile "$plog" -an -f null /dev/null \
+        && run_ffmpeg 50 50 "${vin[@]}" -i "$src" -map 0:V:0 -map '0:a:0?' "${vopts[@]}" \
+            -pass 2 -passlogfile "$plog" "${aopts[@]}" -movflags +faststart "$tmp"
+        rc=$?; rm -f "$plog"*
+    else
+        run_ffmpeg 0 100 "${vin[@]}" -i "$src" -map 0:V:0 -map '0:a:0?' "${vopts[@]}" \
+            "${aopts[@]}" -movflags +faststart "$tmp"
+        rc=$?
+    fi
+    cancelled=$(qd "$dsvc" "$dpath" wasCancelled)
+    qd "$dsvc" "$dpath" close >/dev/null
+
+    if [ "$cancelled" = true ]; then
+        rm -f "$tmp" "$LOG"; notify "Conversion cancelled" "$base"; exit 0
+    elif [ "$rc" -eq 0 ] && [ -s "$tmp" ]; then
+        mv "$tmp" "$dst"; rm -f "$LOG"; ok=$((ok+1))
+    else
+        failed+=("$base: $(tail -n1 "$LOG" 2>/dev/null)"); rm -f "$tmp" "$LOG"
+    fi
+done
+
+if [ ${#failed[@]} -eq 0 ]; then
+    notify "Conversion done" "$ok/$total file(s) converted"
+else
+    notify -u critical "Conversion: ${#failed[@]} failed" "$(printf '%s\n' "${failed[@]}")"
+fi
